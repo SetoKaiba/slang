@@ -848,7 +848,6 @@ void WGSLSourceEmitter::emitVarKeywordImpl(IRType* type, IRInst* varDecl)
     {
     case kIROp_GlobalParam:
     case kIROp_GlobalVar:
-    case kIROp_Var:
         {
             auto layout = getVarLayout(varDecl);
             if (layout && layout->findOffsetAttr(LayoutResourceKind::SpecializationConstant))
@@ -859,6 +858,20 @@ void WGSLSourceEmitter::emitVarKeywordImpl(IRType* type, IRInst* varDecl)
             m_writer->emit("var");
         }
         break;
+    case kIROp_Var:
+        {
+            if (as<IRTextureTypeBase>(type) || as<IRSamplerStateTypeBase>(type))
+            {
+                m_writer->emit("let");
+                break;
+            }
+            m_writer->emit("var");
+        }
+        break;
+    case kIROp_SwizzleSet:
+    case kIROp_UpdateElement:
+        m_writer->emit("var");
+        break;
     default:
         // When this emits `var`, the matching `<private>` address space is emitted by the
         // storage-space chain below (the two must stay in lockstep — a module-scope `var`
@@ -868,7 +881,7 @@ void WGSLSourceEmitter::emitVarKeywordImpl(IRType* type, IRInst* varDecl)
         else if (isStaticConst(varDecl))
             m_writer->emit("const");
         else
-            m_writer->emit("var");
+            m_writer->emit("let");
         break;
     }
 
