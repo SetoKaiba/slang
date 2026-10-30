@@ -301,6 +301,113 @@ void WGSLSourceEmitter::emitSemanticsPrefixImpl(IRInst* inst)
     }
 }
 
+static bool _isWGSLBdaEnabled(WGSLSourceEmitter* emitter)
+{
+    if (auto targetProgram = emitter->getTargetProgram())
+    {
+        return targetProgram->getOptionSet().options.tryGetValue(CompilerOptionName::WGSLBindBdaBuffer) != nullptr;
+    }
+    return false;
+}
+
+static uint32_t getWGSLNaturalAlignment(IRType* type)
+{
+    if (!type)
+        return 4;
+
+    while (true)
+    {
+        if (auto attr = as<IRAttributedType>(type))
+            type = attr->getBaseType();
+        else if (auto rate = as<IRRateQualifiedType>(type))
+            type = rate->getValueType();
+        else
+            break;
+    }
+
+    switch (type->getOp())
+    {
+    case kIROp_HalfType:
+        return 2;
+
+    case kIROp_FloatType:
+    case kIROp_IntType:
+    case kIROp_UIntType:
+    case kIROp_BoolType:
+    case kIROp_IntPtrType:
+    case kIROp_UIntPtrType:
+    case kIROp_RawPointerType:
+        return 4;
+
+    case kIROp_Int64Type:
+    case kIROp_UInt64Type:
+        return 8;
+
+    case kIROp_PtrType:
+    case kIROp_BorrowInOutParamType:
+    case kIROp_OutParamType:
+    case kIROp_RefParamType:
+    case kIROp_BorrowInParamType:
+        return 4;
+
+    case kIROp_VectorType:
+        {
+            auto vecType = as<IRVectorType>(type);
+            uint32_t elemAlign = getWGSLNaturalAlignment(vecType->getElementType());
+            IRIntegerValue count = 4;
+            if (auto countLit = as<IRIntLit>(vecType->getElementCount()))
+                count = countLit->getValue();
+            if (count == 2)
+                return elemAlign * 2;
+            else
+                return elemAlign * 4; // vec3 and vec4 both require 4 * elemAlign (16 for 32-bit types)
+        }
+
+    case kIROp_MatrixType:
+        {
+            auto matType = as<IRMatrixType>(type);
+            uint32_t elemAlign = getWGSLNaturalAlignment(matType->getElementType());
+            // In WGSL (§14.4.1), AlignOf(matCxR) = AlignOf(vecR).
+            // WGSLSourceEmitter maps Slang matrices such that rowCountWGSL = matType->getColumnCount().
+            IRIntegerValue rowCountWGSL = 4;
+            if (auto colLit = as<IRIntLit>(matType->getColumnCount()))
+                rowCountWGSL = colLit->getValue();
+            if (rowCountWGSL == 2)
+                return elemAlign * 2;
+            else
+                return elemAlign * 4; // matCx3 and matCx4 both require 16 bytes for 32-bit types
+        }
+
+    case kIROp_ArrayType:
+    case kIROp_UnsizedArrayType:
+        {
+            auto arrType = as<IRArrayTypeBase>(type);
+            return getWGSLNaturalAlignment(arrType->getElementType());
+        }
+
+    case kIROp_StructType:
+        {
+            auto structType = as<IRStructType>(type);
+            uint32_t maxAlign = 4;
+            if (auto decor = structType->findDecoration<IRSizeAndAlignmentDecoration>())
+            {
+                if (decor->getAlignment() > 0 && decor->getAlignment() <= UINT32_MAX)
+                    maxAlign = (uint32_t)decor->getAlignment();
+            }
+            for (auto f : structType->getFields())
+            {
+                uint32_t fAlign = getWGSLNaturalAlignment(f->getFieldType());
+                if (fAlign > maxAlign)
+                    maxAlign = fAlign;
+            }
+            return maxAlign;
+        }
+
+    default:
+        return 4;
+    }
+}
+
 void WGSLSourceEmitter::emitStructFieldAttributes(
     IRStructType* structType,
     IRStructField* field,
@@ -334,6 +441,13 @@ void WGSLSourceEmitter::emitStructFieldAttributes(
     uint32_t fieldAlignment = 1U;
     while (((fieldAlignment & (structAlignment | fieldOffset)) == 0U))
         fieldAlignment = fieldAlignment << 1U;
+
+    // WGSL specification §6.4 (and §12.1 / §14.4.2): Any @align(A) attribute on a struct
+    // member of type T must satisfy: A is a power of 2, and A is a multiple of AlignOf(T).
+    // Specifically, A must never be smaller than the member type's natural WGSL alignment.
+    const uint32_t naturalAlignment = getWGSLNaturalAlignment(field->getFieldType());
+    if (fieldAlignment < naturalAlignment)
+        fieldAlignment = naturalAlignment;
 
     m_writer->emit("@align(");
     m_writer->emit(fieldAlignment);
@@ -549,9 +663,6 @@ void WGSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
     case kIROp_UIntType:
         m_writer->emit("u32");
         break;
-    case kIROp_UInt64Type:
-        m_writer->emit("u64");
-        return;
     case kIROp_Int16Type:
         diagnoseOnce(Diagnostics::Int16NotSupportedInWgsl{.typeName = "int16_t"});
         return;
@@ -559,11 +670,22 @@ void WGSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
         diagnoseOnce(Diagnostics::Int16NotSupportedInWgsl{.typeName = "uint16_t"});
         return;
     case kIROp_Int64Type:
-    case kIROp_IntPtrType:
         m_writer->emit("i64");
         return;
-    case kIROp_UIntPtrType:
+    case kIROp_UInt64Type:
         m_writer->emit("u64");
+        return;
+    case kIROp_IntPtrType:
+        if (getPointerSize(getTargetReq()) == sizeof(uint64_t))
+            m_writer->emit("i64");
+        else
+            m_writer->emit("i32");
+        return;
+    case kIROp_UIntPtrType:
+        if (getPointerSize(getTargetReq()) == sizeof(uint64_t))
+            m_writer->emit("u64");
+        else
+            m_writer->emit("u32");
         return;
     case kIROp_StructType:
         m_writer->emit(getName(type));
@@ -599,6 +721,14 @@ void WGSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
             return;
         }
 
+    case kIROp_RawPointerType:
+        if (_isWGSLBdaEnabled(this))
+        {
+            m_writer->emit("u32");
+            return;
+        }
+        break;
+
     case kIROp_PtrType:
     case kIROp_BorrowInOutParamType:
     case kIROp_OutParamType:
@@ -606,6 +736,12 @@ void WGSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
     case kIROp_BorrowInParamType:
         {
             auto ptrType = cast<IRPtrTypeBase>(type);
+            if (_isWGSLBdaEnabled(this) &&
+                (isUserPointerType(ptrType) || ptrType->getAddressSpace() == AddressSpace::UserPointer))
+            {
+                m_writer->emit("u32");
+                return;
+            }
             m_writer->emit("ptr<");
             emit((AddressSpace)ptrType->getAddressSpace());
             m_writer->emit(", ");
@@ -1031,7 +1167,11 @@ void WGSLSourceEmitter::emitDeclaratorImpl(DeclaratorInfo* declarator)
 
 void WGSLSourceEmitter::emitOperandImpl(IRInst* operand, EmitOpInfo const& outerPrec)
 {
-    if (operand->getOp() == kIROp_Param && as<IRPtrTypeBase>(operand->getDataType()))
+    auto ptrType = as<IRPtrTypeBase>(operand->getDataType());
+    if (operand->getOp() == kIROp_Param && ptrType &&
+        !isUserPointerType(ptrType) &&
+        ptrType->getAddressSpace() != AddressSpace::UserPointer &&
+        ptrType->getAddressSpace() != AddressSpace::Generic)
     {
         // If we are emitting a reference to a pointer typed operand, then
         // we should dereference it now since we want to treat all the remaining
@@ -1412,7 +1552,13 @@ bool WGSLSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
 
 void WGSLSourceEmitter::emitCallArg(IRInst* inst)
 {
-    if (as<IRPointerLikeType>(inst->getDataType()) || as<IRPtrTypeBase>(inst->getDataType()))
+    auto ptrType = as<IRPtrTypeBase>(inst->getDataType());
+    bool isBdaPointer = _isWGSLBdaEnabled(this) && ptrType &&
+        (isUserPointerType(ptrType) ||
+         ptrType->getAddressSpace() == AddressSpace::UserPointer ||
+         ptrType->getOp() == kIROp_RawPointerType);
+
+    if ((as<IRPointerLikeType>(inst->getDataType()) || ptrType) && !isBdaPointer)
     {
         // If we are calling a function with a pointer-typed argument, we need to
         // explicitly prefix the argument with `&` to pass a pointer.
@@ -1460,6 +1606,46 @@ bool WGSLSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOu
 
     switch (inst->getOp())
     {
+    case kIROp_PtrLit:
+        if (_isWGSLBdaEnabled(this))
+        {
+            auto ptrLit = as<IRPtrLit>(inst);
+            if (ptrLit && ptrLit->getValue())
+            {
+                m_writer->emit(UInt((uint32_t)(uintptr_t)ptrLit->getValue()));
+                m_writer->emit("u");
+            }
+            else
+            {
+                m_writer->emit("0u");
+            }
+            return true;
+        }
+        break;
+
+    case kIROp_CastIntToPtr:
+        if (_isWGSLBdaEnabled(this))
+        {
+            auto op0 = inst->getOperand(0);
+            while (auto intCast = as<IRIntCast>(op0))
+                op0 = intCast->getOperand(0);
+
+            m_writer->emit("u32(");
+            emitOperand(op0, getInfo(EmitOp::General));
+            m_writer->emit(")");
+            return true;
+        }
+        break;
+
+    case kIROp_CastPtrToInt:
+    case kIROp_PtrCast:
+        if (_isWGSLBdaEnabled(this))
+        {
+            emitOperand(inst->getOperand(0), outerPrec);
+            return true;
+        }
+        break;
+
     case kIROp_MakeVectorFromScalar:
         {
             // In WGSL this is done by calling the vec* overloads listed in [1]

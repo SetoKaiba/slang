@@ -13,6 +13,7 @@
 #include "slang-ir-layout.h"
 #include "slang-ir-util.h"
 #include "slang-rich-diagnostics.h"
+#include "slang-target-program.h"
 
 namespace Slang
 {
@@ -31,6 +32,15 @@ struct ByteAddressBufferLegalizationContext
     TargetProgram* m_targetProgram = nullptr;
     TargetRequest* m_target = nullptr;
     ByteAddressBufferLegalizationOptions m_options;
+
+    bool isWGSLBdaEnabled() const
+    {
+        if (m_targetProgram && isWGPUTarget(m_target))
+        {
+            return m_targetProgram->getOptionSet().options.tryGetValue(CompilerOptionName::WGSLBindBdaBuffer) != nullptr;
+        }
+        return false;
+    }
 
     DiagnosticSink* m_sink = nullptr;
     // We will also use a central IR builder when generating new
@@ -929,6 +939,10 @@ struct ByteAddressBufferLegalizationContext
                 // so we use proper cast operations instead of bit casts.
                 if (type->getOp() == kIROp_PtrType || type->getOp() == kIROp_RawPointerType)
                 {
+                    if (isWGSLBdaEnabled())
+                    {
+                        return m_builder.emitCastIntToPtr(type, loLoad);
+                    }
                     // Use proper cast operation instead of bit cast for pointers
                     return m_builder.emitCastIntToPtr(type, fullValue);
                 }
@@ -1735,6 +1749,17 @@ struct ByteAddressBufferLegalizationContext
                 IRInst* uint64Val;
                 if (type->getOp() == kIROp_PtrType || type->getOp() == kIROp_RawPointerType)
                 {
+                    if (isWGSLBdaEnabled())
+                    {
+                        loVal = m_builder.emitCast(m_builder.getUIntType(), m_builder.emitCastPtrToInt(value));
+                        hiVal = m_builder.getIntValue(m_builder.getUIntType(), 0);
+                        auto loOffset = offset;
+                        auto hiOffset = emitOffsetAddIfNeeded(offset, 4);
+                        IRInst* alignment = m_builder.getIntValue(m_builder.getUIntType(), 0);
+                        m_builder.emitByteAddressBufferStore(buffer, loOffset, alignment, loVal);
+                        m_builder.emitByteAddressBufferStore(buffer, hiOffset, alignment, hiVal);
+                        return SLANG_OK;
+                    }
                     // Use proper cast operation instead of bit cast for pointers
                     uint64Val = m_builder.emitCastPtrToInt(value);
                 }
