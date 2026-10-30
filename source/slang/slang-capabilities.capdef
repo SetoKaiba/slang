@@ -305,6 +305,10 @@ alias cpp_cuda_metal_spirv = cpp | cuda | metal | spirv;
 /// [Compound]
 alias cpp_cuda_metal_spirv_llvm = cpp | cuda | metal | spirv | llvm;
 
+/// Target capabilities supporting address-of operator
+/// [Compound]
+alias address_of_targets = cpp | cuda | metal | spirv | llvm | wgsl;
+
 /// CUDA and SPIRV code-gen targets
 /// [Compound]
 alias cuda_spirv = cuda | spirv;

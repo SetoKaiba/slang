@@ -933,6 +933,10 @@ void initCommandOptions(CommandOptions& options)
          nullptr,
          "Reciprocates (multiplicatively inverts) SV_Position.w after reading from stage input. "
          "For use in fragment shaders only."},
+        {OptionKind::WGSLBindBdaBuffer,
+         "-fwgsl-bind-bda-buffer",
+         "-fwgsl-bind-bda-buffer <binding> <group>",
+         "Places the simulated WebGPU BDA buffer at group <group> and binding <binding>."},
         {OptionKind::VulkanUseEntryPointName,
          "-fvk-use-entrypoint-name",
          nullptr,
@@ -3322,6 +3326,24 @@ SlangResult OptionsParser::_parse(int argc, char const* const* argv)
                     OptionKind::VulkanBindGlobals,
                     (int)binding,
                     (int)bindingSet);
+                break;
+            }
+        case OptionKind::WGSLBindBdaBuffer:
+            {
+                Int binding, group;
+                SLANG_RETURN_ON_FAIL(_expectInt(arg, binding));
+                SLANG_RETURN_ON_FAIL(_expectInt(arg, group));
+                linkage->m_optionSet.set(
+                    OptionKind::WGSLBindBdaBuffer,
+                    (int)binding,
+                    (int)group);
+                if (auto target = getCurrentTarget())
+                {
+                    target->optionSet.set(
+                        OptionKind::WGSLBindBdaBuffer,
+                        (int)binding,
+                        (int)group);
+                }
                 break;
             }
         case OptionKind::TraceCoverageBinding:

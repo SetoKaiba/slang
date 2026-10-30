@@ -2141,6 +2141,17 @@ Result linkAndOptimizeIR(
         break;
     }
 
+    if (isWGPUTarget(targetRequest))
+    {
+        if (targetProgram->getOptionSet().options.tryGetValue(CompilerOptionName::WGSLBindBdaBuffer))
+        {
+            if (SLANG_PASS(lowerRawPointersForWGSL, targetProgram, codeGenContext->getSink()))
+            {
+                requiredLoweringPassSet.byteAddressBuffer = true;
+            }
+        }
+    }
+
     // For all targets, we translate load/store operations
     // of aggregate types from/to byte-address buffers into
     // stores of individual scalar or vector values.
@@ -2589,6 +2600,11 @@ Result linkAndOptimizeIR(
             SLANG_PASS(invertYOfPositionOutput);
         if (targetProgram->getOptionSet().getBoolOption(CompilerOptionName::VulkanUseDxPositionW))
             SLANG_PASS(rcpWOfPositionInput);
+    }
+    else if (isWGPUTarget(targetRequest))
+    {
+        if (targetProgram->getOptionSet().getBoolOption(CompilerOptionName::VulkanInvertY))
+            SLANG_PASS(invertYOfWGSLVertexPositionOutput);
     }
 
     BufferElementTypeLoweringOptions bufferElementTypeLoweringOptions = {};

@@ -3443,6 +3443,26 @@ TargetBuiltinTypeLayoutInfo getBuiltinTypeLayoutInfo(TargetRequest* targetReq)
     if (!targetReq)
         return info;
 
+    if (isWGPUTarget(targetReq))
+    {
+        auto checkWasm32 = [](CompilerOptionSet& optionSet) -> bool
+        {
+            for (const auto& define : optionSet.getArray(CompilerOptionName::MacroDefine))
+            {
+                if (define.stringValue == "__wasm32__")
+                    return true;
+            }
+            return false;
+        };
+
+        if (checkWasm32(targetReq->getOptionSet()) ||
+            (targetReq->getLinkage() && checkWasm32(targetReq->getLinkage()->m_optionSet)))
+        {
+            info.genericPointerSize = 4;
+            return info;
+        }
+    }
+
     // If we're using an LLVM target, we should ask from LLVM.
     if (isCPUTargetViaLLVM(targetReq) && getLLVMBuiltinTypeLayoutInfo(targetReq, &info))
         return info;

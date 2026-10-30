@@ -153,6 +153,12 @@ void CompilerOptionSet::writeCommandLineArgs(Session* globalSession, StringBuild
                 sb << " " << name << " " << v.intValue << " " << v.intValue2;
             }
             break;
+        case CompilerOptionName::WGSLBindBdaBuffer: // intValue0: binding; intValue1: group
+            for (auto v : option.value)
+            {
+                sb << " " << name << " " << v.intValue << " " << v.intValue2;
+            }
+            break;
         case CompilerOptionName::TraceCoverageBinding: // intValue0: index; intValue1: space
             for (auto v : option.value)
             {

@@ -1347,6 +1347,8 @@ typedef uint32_t SlangSizeT;
 
         BitfieldPackingRules = 160, // intValue0: slang::BitfieldPackingRules
 
+        WGSLBindBdaBuffer = 161, // intValue0: binding; intValue1: group
+
         // Do not assign an explicit value to CountOf. It must remain one past the last option,
         // which it derives implicitly from the preceding (highest-valued) enumerator.
         CountOf,

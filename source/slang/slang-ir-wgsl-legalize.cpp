@@ -4,6 +4,7 @@
 #include "slang-ir-legalize-binary-operator.h"
 #include "slang-ir-legalize-global-values.h"
 #include "slang-ir-legalize-varying-params.h"
+#include "slang-ir-layout.h"
 #include "slang-ir-specialize-address-space.h"
 #include "slang-ir-util.h"
 #include "slang-ir.h"
@@ -57,6 +58,11 @@ static void legalizeCall(IRCall* call)
         auto arg = call->getArg(i);
         auto ptrType = as<IRPtrTypeBase>(arg->getDataType());
         if (!ptrType)
+            continue;
+
+        // User buffer pointers (BDA / mega-buffer byte offsets) are passed as scalar offsets,
+        // not stack references. Skip bridging them through function-space temporaries.
+        if (isUserPointerType(ptrType) || ptrType->getAddressSpace() == AddressSpace::UserPointer)
             continue;
 
         auto argOp = arg->getOp();
@@ -353,6 +359,441 @@ void specializeAddressSpaceForWGSL(IRModule* module)
 {
     WGSLAddressSpaceAssigner wgslAddressSpaceAssigner;
     specializeAddressSpace(module, &wgslAddressSpaceAssigner);
+}
+
+static IRInst* _findOrCreateMegaBuffer(IRModule* module, bool isRW, int binding, int group)
+{
+    for (auto inst : module->getGlobalInsts())
+    {
+        if (auto globalParam = as<IRGlobalParam>(inst))
+        {
+            if (auto nameHint = globalParam->findDecoration<IRNameHintDecoration>())
+            {
+                if (nameHint->getName() == "__mega_buffer")
+                    return globalParam;
+            }
+        }
+    }
+
+    IRBuilder builder(module);
+    builder.setInsertBefore(module->getModuleInst()->getFirstChild());
+    IRType* bufferType = (IRType*)builder.getType(
+        isRW ? kIROp_HLSLRWByteAddressBufferType : kIROp_HLSLByteAddressBufferType);
+    auto megaBuffer = builder.createGlobalParam(bufferType);
+    builder.addNameHintDecoration(megaBuffer, toSlice("__mega_buffer"));
+
+    auto resKind = isRW ? LayoutResourceKind::UnorderedAccess : LayoutResourceKind::ShaderResource;
+    IRTypeLayout::Builder typeLayoutBuilder(&builder);
+    typeLayoutBuilder.addResourceUsage(resKind, 1);
+    auto typeLayout = typeLayoutBuilder.build();
+    IRVarLayout::Builder varLayoutBuilder(&builder, typeLayout);
+    varLayoutBuilder.findOrAddResourceInfo(LayoutResourceKind::RegisterSpace)->offset = group;
+    varLayoutBuilder.findOrAddResourceInfo(resKind)->offset = binding;
+    auto varLayout = varLayoutBuilder.build();
+    builder.addLayoutDecoration(megaBuffer, varLayout);
+
+    return megaBuffer;
+}
+
+static bool _isRawPointer(IRInst* inst)
+{
+    auto type = inst->getDataType();
+    if (!type)
+        return false;
+    if (isUserPointerType(type))
+        return true;
+    if (type->getOp() == kIROp_RawPointerType)
+        return true;
+    if (auto ptrType = as<IRPtrTypeBase>(type))
+    {
+        if (ptrType->getAddressSpace() == AddressSpace::UserPointer)
+            return true;
+    }
+    return false;
+}
+
+static IRInst* _getPointerByteOffset(
+    IRBuilder& builder,
+    IRInst* ptr,
+    TargetProgram* targetProgram,
+    Dictionary<IRInst*, IRInst*>& offsetCache)
+{
+    const bool inBlock = as<IRBlock>(ptr->getParent()) != nullptr;
+    IRInst* cached = nullptr;
+    if (inBlock && offsetCache.tryGetValue(ptr, cached))
+        return cached;
+
+    auto savedLoc = builder.getInsertLoc();
+    if (inBlock)
+    {
+        setInsertAfterOrdinaryInst(&builder, ptr);
+    }
+
+    IRInst* result = nullptr;
+    switch (ptr->getOp())
+    {
+    case kIROp_CastIntToPtr:
+        result = builder.emitCast(builder.getUIntType(), ptr->getOperand(0));
+        break;
+
+    case kIROp_PtrCast:
+    case kIROp_BitCast:
+        result = _getPointerByteOffset(builder, ptr->getOperand(0), targetProgram, offsetCache);
+        break;
+
+    case kIROp_GetOffsetPtr:
+    case kIROp_GetElementPtr:
+        {
+            auto basePtr = ptr->getOperand(0);
+            auto index = ptr->getOperand(1);
+            auto baseOffset = _getPointerByteOffset(builder, basePtr, targetProgram, offsetCache);
+            auto ptrType = as<IRPtrTypeBase>(ptr->getDataType());
+            SLANG_ASSERT(ptrType);
+            auto elemType = (IRType*)ptrType->getValueType();
+            IRSizeAndAlignment sizeAlignment;
+            getNaturalSizeAndAlignment(targetProgram->getTargetReq(), elemType, &sizeAlignment);
+            auto indexU32 = builder.emitCast(builder.getUIntType(), index);
+            auto strideVal = builder.getIntValue(builder.getUIntType(), (uint32_t)sizeAlignment.getStride());
+            auto delta = builder.emitMul(builder.getUIntType(), indexU32, strideVal);
+            result = builder.emitAdd(builder.getUIntType(), baseOffset, delta);
+        }
+        break;
+
+    case kIROp_FieldAddress:
+        {
+            auto basePtr = ptr->getOperand(0);
+            auto fieldKey = ptr->getOperand(1);
+            auto baseOffset = _getPointerByteOffset(builder, basePtr, targetProgram, offsetCache);
+            auto ptrType = as<IRPtrTypeBase>(basePtr->getDataType());
+            SLANG_ASSERT(ptrType);
+            auto structType = as<IRStructType>(ptrType->getValueType());
+            SLANG_ASSERT(structType);
+            IRStructField* targetField = nullptr;
+            for (auto field : structType->getFields())
+            {
+                if (field->getKey() == fieldKey)
+                {
+                    targetField = field;
+                    break;
+                }
+            }
+            IRIntegerValue fieldOffset = 0;
+            if (targetField)
+            {
+                getNaturalOffset(targetProgram->getTargetReq(), targetField, &fieldOffset);
+            }
+            auto offsetVal = builder.getIntValue(builder.getUIntType(), (uint32_t)fieldOffset);
+            result = builder.emitAdd(builder.getUIntType(), baseOffset, offsetVal);
+        }
+        break;
+
+    case kIROp_Add:
+        {
+            IRInst* ptrOp = _isRawPointer(ptr->getOperand(0)) ? ptr->getOperand(0) : ptr->getOperand(1);
+            IRInst* idxOp = (ptrOp == ptr->getOperand(0)) ? ptr->getOperand(1) : ptr->getOperand(0);
+            auto baseOffset = _getPointerByteOffset(builder, ptrOp, targetProgram, offsetCache);
+            auto ptrType = as<IRPtrTypeBase>(ptrOp->getDataType());
+            auto elemType = (IRType*)ptrType->getValueType();
+            IRSizeAndAlignment sizeAlignment;
+            getNaturalSizeAndAlignment(targetProgram->getTargetReq(), elemType, &sizeAlignment);
+            auto indexU32 = builder.emitCast(builder.getUIntType(), idxOp);
+            auto strideVal = builder.getIntValue(builder.getUIntType(), (uint32_t)sizeAlignment.getStride());
+            auto delta = builder.emitMul(builder.getUIntType(), indexU32, strideVal);
+            result = builder.emitAdd(builder.getUIntType(), baseOffset, delta);
+        }
+        break;
+
+    case kIROp_Sub:
+        {
+            auto baseOffset = _getPointerByteOffset(builder, ptr->getOperand(0), targetProgram, offsetCache);
+            auto ptrType = as<IRPtrTypeBase>(ptr->getOperand(0)->getDataType());
+            auto elemType = (IRType*)ptrType->getValueType();
+            IRSizeAndAlignment sizeAlignment;
+            getNaturalSizeAndAlignment(targetProgram->getTargetReq(), elemType, &sizeAlignment);
+            auto indexU32 = builder.emitCast(builder.getUIntType(), ptr->getOperand(1));
+            auto strideVal = builder.getIntValue(builder.getUIntType(), (uint32_t)sizeAlignment.getStride());
+            auto delta = builder.emitMul(builder.getUIntType(), indexU32, strideVal);
+            result = builder.emitSub(builder.getUIntType(), baseOffset, delta);
+        }
+        break;
+    default:
+        result = builder.emitCast(builder.getUIntType(), builder.emitCastPtrToInt(ptr));
+        break;
+    }
+
+    builder.setInsertLoc(savedLoc);
+    if (inBlock)
+    {
+        offsetCache.add(ptr, result);
+    }
+    return result;
+}
+
+bool lowerRawPointersForWGSL(
+    IRModule* module,
+    TargetProgram* targetProgram,
+    DiagnosticSink* sink)
+{
+    SLANG_UNUSED(sink);
+    if (!isWGPUTarget(targetProgram->getTargetReq()))
+        return false;
+
+    auto bdaOption = targetProgram->getOptionSet().options.tryGetValue(CompilerOptionName::WGSLBindBdaBuffer);
+    if (!bdaOption || bdaOption->getCount() == 0)
+        return false;
+    const int binding = (*bdaOption)[0].intValue;
+    const int group = (*bdaOption)[0].intValue2;
+
+    HashSet<IRFunc*> reachableFuncs;
+    List<IRFunc*> workList;
+    for (auto inst : module->getGlobalInsts())
+    {
+        if (auto func = as<IRFunc>(inst))
+        {
+            if (func->findDecoration<IREntryPointDecoration>())
+            {
+                if (reachableFuncs.add(func))
+                    workList.add(func);
+            }
+        }
+    }
+    if (workList.getCount() == 0)
+    {
+        for (auto inst : module->getGlobalInsts())
+        {
+            if (auto func = as<IRFunc>(inst))
+            {
+                if (reachableFuncs.add(func))
+                    workList.add(func);
+            }
+        }
+    }
+    while (workList.getCount() > 0)
+    {
+        auto func = workList.getLast();
+        workList.removeLast();
+        for (auto block : func->getBlocks())
+        {
+            for (auto child : block->getChildren())
+            {
+                if (auto call = as<IRCall>(child))
+                {
+                    if (auto callee = as<IRFunc>(call->getCallee()))
+                    {
+                        if (reachableFuncs.add(callee))
+                            workList.add(callee);
+                    }
+                }
+            }
+        }
+    }
+
+    List<IRLoad*> rawLoads;
+    List<IRStore*> rawStores;
+    bool hasRawPointerAccess = false;
+
+    for (auto func : reachableFuncs)
+    {
+        for (auto block : func->getBlocks())
+        {
+            for (auto child : block->getChildren())
+            {
+                if (auto load = as<IRLoad>(child))
+                {
+                    if (_isRawPointer(load->getPtr()))
+                    {
+                        rawLoads.add(load);
+                        hasRawPointerAccess = true;
+                    }
+                }
+                else if (auto store = as<IRStore>(child))
+                {
+                    if (_isRawPointer(store->getPtr()))
+                    {
+                        rawStores.add(store);
+                        hasRawPointerAccess = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if (!hasRawPointerAccess)
+        return false;
+
+    bool isCompute = false;
+    for (auto inst : module->getGlobalInsts())
+    {
+        if (auto func = as<IRFunc>(inst))
+        {
+            if (auto entryPointDecor = func->findDecoration<IREntryPointDecoration>())
+            {
+                if (entryPointDecor->getProfile().getStage() == Stage::Compute)
+                {
+                    isCompute = true;
+                    break;
+                }
+            }
+        }
+    }
+    const bool isRW = isCompute;
+
+    auto megaBuffer = _findOrCreateMegaBuffer(module, isRW, binding, group);
+    Dictionary<IRInst*, IRInst*> offsetCache;
+
+    for (auto load : rawLoads)
+    {
+        IRBuilder builder(load);
+        builder.setInsertBefore(load);
+        auto byteOffset = _getPointerByteOffset(builder, load->getPtr(), targetProgram, offsetCache);
+        auto alignment = builder.getIntValue(builder.getUIntType(), 0);
+        IRInst* args[] = {megaBuffer, byteOffset, alignment};
+        auto bufLoad = builder.emitIntrinsicInst(
+            load->getDataType(),
+            kIROp_ByteAddressBufferLoad,
+            3,
+            args);
+        load->replaceUsesWith(bufLoad);
+        load->removeAndDeallocate();
+    }
+
+    for (auto store : rawStores)
+    {
+        IRBuilder builder(store);
+        builder.setInsertBefore(store);
+        auto byteOffset = _getPointerByteOffset(builder, store->getPtr(), targetProgram, offsetCache);
+        auto alignment = builder.getIntValue(builder.getUIntType(), 0);
+        builder.emitByteAddressBufferStore(megaBuffer, byteOffset, alignment, store->getVal());
+        store->removeAndDeallocate();
+    }
+
+    return true;
+}
+
+static IRInst* _invertYOfWGSLVector(IRBuilder& builder, IRInst* originalVector)
+{
+    auto vectorType = as<IRVectorType>(originalVector->getDataType());
+    SLANG_ASSERT(vectorType);
+    auto elemType = vectorType->getElementType();
+    IRInst* one = builder.getFloatValue(elemType, 1.0);
+    IRInst* negOne = builder.getFloatValue(elemType, -1.0);
+    auto elemCountInst = as<IRIntLit>(vectorType->getElementCount());
+    int elemCount = elemCountInst ? (int)elemCountInst->getValue() : 4;
+    ShortList<IRInst*> elements;
+    for (int i = 0; i < elemCount; i++)
+    {
+        elements.add(i == 1 ? negOne : one);
+    }
+    auto scale = builder.emitMakeVector(
+        vectorType,
+        (UInt)elements.getCount(),
+        elements.getArrayView().getBuffer());
+    return builder.emitMul(vectorType, originalVector, scale);
+}
+
+static bool _isPositionSemantic(UnownedStringSlice name)
+{
+    return name.caseInsensitiveEquals(toSlice("position")) ||
+           name.caseInsensitiveEquals(toSlice("sv_position"));
+}
+
+static bool _isPositionKey(IRInst* key)
+{
+    if (auto sysValDecor = key->findDecoration<IRTargetSystemValueDecoration>())
+    {
+        if (_isPositionSemantic(sysValDecor->getSemantic()))
+            return true;
+    }
+    if (auto semDecor = key->findDecoration<IRSemanticDecoration>())
+    {
+        if (_isPositionSemantic(semDecor->getSemanticName()))
+            return true;
+    }
+    return false;
+}
+
+void invertYOfWGSLVertexPositionOutput(IRModule* module)
+{
+    for (auto globalInst : module->getGlobalInsts())
+    {
+        auto func = as<IRFunc>(globalInst);
+        if (!func)
+            continue;
+        auto entryPointDecor = func->findDecoration<IREntryPointDecoration>();
+        if (!entryPointDecor || entryPointDecor->getProfile().getStage() != Stage::Vertex)
+            continue;
+
+        IRBuilder builder(module);
+        if (as<IRVectorType>(func->getResultType()))
+        {
+            for (auto block : func->getBlocks())
+            {
+                if (auto ret = as<IRReturn>(block->getTerminator()))
+                {
+                    builder.setInsertBefore(ret);
+                    auto originalVal = ret->getVal();
+                    auto invertedVal = _invertYOfWGSLVector(builder, originalVal);
+                    builder.replaceOperand(ret->getOperands(), invertedVal);
+                }
+            }
+        }
+        else if (auto structType = as<IRStructType>(func->getResultType()))
+        {
+            Index positionFieldIndex = -1;
+            Index currentIndex = 0;
+            IRStructKey* positionKey = nullptr;
+            for (auto field : structType->getFields())
+            {
+                if (_isPositionKey(field->getKey()))
+                {
+                    positionFieldIndex = currentIndex;
+                    positionKey = field->getKey();
+                    break;
+                }
+                currentIndex++;
+            }
+            if (positionFieldIndex != -1)
+            {
+                for (auto block : func->getBlocks())
+                {
+                    for (auto inst : block->getChildren())
+                    {
+                        if (auto store = as<IRStore>(inst))
+                        {
+                            if (auto fieldAddr = as<IRFieldAddress>(store->getPtr()))
+                            {
+                                if (fieldAddr->getField() == positionKey)
+                                {
+                                    builder.setInsertBefore(store);
+                                    auto originalVal = store->getVal();
+                                    if (as<IRVectorType>(originalVal->getDataType()))
+                                    {
+                                        auto invertedVal = _invertYOfWGSLVector(builder, originalVal);
+                                        builder.replaceOperand(&store->val, invertedVal);
+                                    }
+                                }
+                            }
+                        }
+                        else if (inst->getOp() == kIROp_MakeStruct && inst->getDataType() == structType)
+                        {
+                            if ((UInt)positionFieldIndex < inst->getOperandCount())
+                            {
+                                auto posVal = inst->getOperand(positionFieldIndex);
+                                if (as<IRVectorType>(posVal->getDataType()))
+                                {
+                                    builder.setInsertBefore(inst);
+                                    auto invertedVal = _invertYOfWGSLVector(builder, posVal);
+                                    builder.replaceOperand(
+                                        inst->getOperands() + positionFieldIndex,
+                                        invertedVal);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 } // namespace Slang

@@ -3273,6 +3273,114 @@ struct WGSLBufferElementTypeLoweringPolicy : DefaultBufferElementTypeLoweringPol
     {
     }
 
+    bool isBdaEnabled() const
+    {
+        return target && target->getOptionSet().options.tryGetValue(CompilerOptionName::WGSLBindBdaBuffer) != nullptr;
+    }
+
+    static bool _isRawPointerType(IRType* type)
+    {
+        if (!type)
+            return false;
+        if (isUserPointerType(type) || type->getOp() == kIROp_RawPointerType)
+            return true;
+        if (auto ptrType = as<IRPtrTypeBase>(type))
+        {
+            if (ptrType->getAddressSpace() == AddressSpace::UserPointer)
+                return true;
+        }
+        return false;
+    }
+
+    IRFunc* createPointerVec2UnpackFunc(IRType* originalPtrType, IRType* vec2Type)
+    {
+        IRBuilder builder(vec2Type);
+        builder.setInsertAfter(vec2Type);
+        auto func = builder.createFunc();
+        auto refVec2Type = builder.getRefParamType(vec2Type, AddressSpace::Generic);
+        auto funcType = builder.getFuncType(1, (IRType**)&refVec2Type, originalPtrType);
+        func->setFullType(funcType);
+        builder.addNameHintDecoration(func, toSlice("__unpackBdaPtr"));
+        builder.addForceInlineDecoration(func);
+        builder.setInsertInto(func);
+        builder.emitBlock();
+
+        auto refParam = builder.emitParam(refVec2Type);
+        auto vecVal = builder.emitLoad(refParam);
+        auto offset = builder.emitElementExtract(vecVal, IRIntegerValue(0));
+        auto ptrVal = builder.emitCastIntToPtr(originalPtrType, offset);
+        builder.emitReturn(ptrVal);
+        return func;
+    }
+
+    IRFunc* createPointerVec2PackFunc(IRType* originalPtrType, IRType* vec2Type)
+    {
+        IRBuilder builder(vec2Type);
+        builder.setInsertAfter(vec2Type);
+        auto func = builder.createFunc();
+        auto outVec2Type = builder.getRefParamType(vec2Type, AddressSpace::Generic);
+        IRType* paramTypes[] = {outVec2Type, originalPtrType};
+        auto funcType = builder.getFuncType(2, paramTypes, builder.getVoidType());
+        func->setFullType(funcType);
+        builder.addNameHintDecoration(func, toSlice("__packBdaPtr"));
+        builder.addForceInlineDecoration(func);
+        builder.setInsertInto(func);
+        builder.emitBlock();
+
+        auto destRef = builder.emitParam(outVec2Type);
+        auto ptrVal = builder.emitParam(originalPtrType);
+        auto offset = builder.emitCast(builder.getUIntType(), builder.emitCastPtrToInt(ptrVal));
+        IRInst* zero = builder.getIntValue(builder.getUIntType(), 0);
+        IRInst* elems[] = {offset, zero};
+        auto vecVal = builder.emitMakeVector(vec2Type, 2, elems);
+        builder.emitStore(destRef, vecVal);
+        builder.emitReturn();
+        return func;
+    }
+
+    bool needsElementLowering(IRType* elementType) override
+    {
+        if (!isBdaEnabled())
+            return DefaultBufferElementTypeLoweringPolicy::needsElementLowering(elementType);
+
+        if (_isRawPointerType(elementType))
+            return true;
+        if (auto arrType = as<IRArrayTypeBase>(elementType))
+            return needsElementLowering((IRType*)arrType->getElementType());
+        if (auto structType = as<IRStructType>(elementType))
+        {
+            for (auto field : structType->getFields())
+                if (needsElementLowering(field->getFieldType()))
+                    return true;
+        }
+        return DefaultBufferElementTypeLoweringPolicy::needsElementLowering(elementType);
+    }
+
+    LoweredElementTypeInfo lowerLeafLogicalType(IRType* type, TypeLoweringConfig config) override
+    {
+        if (isBdaEnabled() && _isRawPointerType(type))
+        {
+            LoweredElementTypeInfo info;
+            info.originalType = type;
+            IRBuilder builder(type);
+            if (getPointerSize(target->getTargetReq()) == 4)
+            {
+                info.loweredType = builder.getUIntType();
+                info.convertLoweredToOriginal = kIROp_CastIntToPtr;
+                info.convertOriginalToLowered = kIROp_CastPtrToInt;
+            }
+            else
+            {
+                auto vec2Type = builder.getVectorType(builder.getUIntType(), 2);
+                info.loweredType = vec2Type;
+                info.convertLoweredToOriginal = createPointerVec2UnpackFunc(type, vec2Type);
+                info.convertOriginalToLowered = createPointerVec2PackFunc(type, vec2Type);
+            }
+            return info;
+        }
+        return DefaultBufferElementTypeLoweringPolicy::lowerLeafLogicalType(type, config);
+    }
+
     virtual bool shouldTranslateArrayElementTo16ByteAlignedVectorForConstantBuffer() override
     {
         return true;
